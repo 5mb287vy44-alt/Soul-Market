@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-26
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -23,6 +23,10 @@ jobs:
             -sdk "$SDK" -target arm64-apple-ios16.0 \
             -swift-version 5 -O -parse-as-library \
             -o "$APP/SoulMarket"
+          if [ -f icon.png ]; then
+            sips -z 120 120 icon.png --out "$APP/AppIcon60x60@2x.png"
+            sips -z 180 180 icon.png --out "$APP/AppIcon60x60@3x.png"
+          fi
           cat > "$APP/Info.plist" <<'EOF'
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -35,6 +39,7 @@ jobs:
           <key>CFBundlePackageType</key><string>APPL</string>
           <key>MinimumOSVersion</key><string>16.0</string>
           <key>UILaunchScreen</key><dict/>
+          <key>CFBundleIcons</key><dict><key>CFBundlePrimaryIcon</key><dict><key>CFBundleIconFiles</key><array><string>AppIcon60x60</string></array></dict></dict>
           <key>UIDeviceFamily</key><array><integer>1</integer></array>
           <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
           </dict></plist>
