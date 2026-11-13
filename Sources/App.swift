@@ -1,6 +1,7 @@
 import SwiftUI
 
-enum Kind { case stock, crypto, realty }
+enum Kind { case stock, fund, crypto, realty }
+enum Mode { case sim, real }
 enum Phase { case pick, play, relic, won, lost }
 
 enum Build: String, CaseIterable {
@@ -41,7 +42,67 @@ struct Asset: Identifiable {
 
 func money(_ v: Double) -> String { "$\(Int(v))" }
 
+struct YF: Decodable {
+    struct Chart: Decodable { let result: [R]? }
+    struct R: Decodable { let timestamp: [Int]?; let indicators: Ind }
+    struct Ind: Decodable { let quote: [Q] }
+    struct Q: Decodable { let close: [Double?] }
+    let chart: Chart
+}
+
+func fetchCloses(_ sym: String) async -> [String: Double]? {
+    guard let url = URL(string: "https://query1.finance.yahoo.com/v8/finance/chart/\(sym)?range=2y&interval=1d") else { return nil }
+    var req = URLRequest(url: url)
+    req.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+    req.timeoutInterval = 20
+    guard let (data, _) = try? await URLSession.shared.data(for: req),
+          let yf = try? JSONDecoder().decode(YF.self, from: data),
+          let r = yf.chart.result?.first,
+          let ts = r.timestamp,
+          let q = r.indicators.quote.first else { return nil }
+    let f = DateFormatter()
+    f.locale = Locale(identifier: "en_US_POSIX")
+    f.dateFormat = "yyyy-MM-dd"
+    f.timeZone = TimeZone(identifier: "UTC")
+    var m: [String: Double] = [:]
+    for (t, c) in zip(ts, q.close) {
+        if let c = c { m[f.string(from: Date(timeIntervalSince1970: Double(t)))] = c }
+    }
+    return m
+}
+
+func downloadReal() async -> ([String], [[Double]])? {
+    let syms = Game.realSyms.map { $0.sym }
+    var maps: [String: [String: Double]] = [:]
+    await withTaskGroup(of: (String, [String: Double]?).self) { group in
+        for s in syms { group.addTask { (s, await fetchCloses(s)) } }
+        for await (s, m) in group { if let m = m { maps[s] = m } }
+    }
+    guard maps.count == syms.count, let base = maps["AAPL"] else { return nil }
+    let dates = base.keys.sorted()
+    var cols: [[Double]] = []
+    for s in syms {
+        guard let m = maps[s] else { return nil }
+        var last = -1.0
+        var col: [Double] = []
+        for d in dates {
+            if let v = m[d] { last = v }
+            col.append(last)
+        }
+        cols.append(col)
+    }
+    guard let first = (0..<dates.count).first(where: { i in cols.allSatisfy { $0[i] > 0 } }),
+          dates.count - first > 70 else { return nil }
+    return (Array(dates[first...]), cols.map { Array($0[first...]) })
+}
+
 final class Game: ObservableObject {
+    static let realSyms: [(sym: String, name: String, kind: Kind)] = [
+        ("AAPL", "AAPL", .stock), ("NVDA", "NVDA", .stock),
+        ("SPY", "SPY", .fund), ("QQQ", "QQQ", .fund),
+        ("BTC-USD", "BTC", .crypto), ("ETH-USD", "ETH", .crypto),
+        ("VNQ", "VNQ", .realty), ("O", "O", .realty)
+    ]
     static let events = [
         Ev(t: "Бум на рынке", s: 0.08, c: 0.10, r: 0.01),
         Ev(t: "Крах крипты", s: -0.06, c: -0.25, r: 0),
@@ -60,6 +121,15 @@ final class Game: ObservableObject {
     @Published var offer: [Relic] = []
     @Published var log = "Рынок открыт."
     @Published var next = Game.events.randomElement()!
+    @Published var mode = UserDefaults.standard.bool(forKey: "realMode") ? Mode.real : Mode.sim
+    @Published var loading = false
+    @Published var note = ""
+    @Published var nextInfo = ""
+    var trend = 0.0
+    var realDates: [String] = []
+    var realCols: [[Double]] = []
+    var idx = 0
+    var startIdx = 0
     @Published var assets = [
         Asset(id: "NeoCorp", kind: .stock, vol: 0.03, price: 100),
         Asset(id: "Квант", kind: .stock, vol: 0.04, price: 250),
@@ -82,19 +152,82 @@ final class Game: ObservableObject {
             }
             assets[i].hist = h
         }
+        nextInfo = next.t
     }
 
-    var soulPrice: Double { 10000 * pow(1.02, Double(day - 1)) }
+    var soulPrice: Double {
+        mode == .real ? 5800 * pow(1.005, Double(day - 1)) : 10000 * pow(1.02, Double(day - 1))
+    }
     var maxActions: Int { build == .scalper ? 4 : 3 }
     var fee: Double { build == .scalper ? 0.005 : 0.02 }
     var worth: Double { cash + assets.reduce(0) { $0 + $1.price * $1.qty } }
 
     func has(_ r: Relic) -> Bool { relics.contains(r) }
 
-    func start(_ b: Build) {
+    func setMode(_ m: Mode) {
+        mode = m
+        UserDefaults.standard.set(m == .real, forKey: "realMode")
+    }
+
+    func startRun(_ b: Build) {
+        guard !loading else { return }
         build = b
+        note = ""
+        if mode == .sim {
+            actions = maxActions
+            phase = .play
+            return
+        }
+        loading = true
+        Task { @MainActor [self] in
+            if let r = await downloadReal() {
+                beginReal(r.0, r.1)
+            } else {
+                note = "Нет данных с бирж, запущена симуляция"
+                mode = .sim
+                actions = maxActions
+                phase = .play
+            }
+            loading = false
+        }
+    }
+
+    func beginReal(_ d: [String], _ c: [[Double]]) {
+        realDates = d
+        realCols = c
+        startIdx = Int.random(in: 24...(d.count - 38))
+        idx = startIdx
+        var list: [Asset] = []
+        for (k, s) in Game.realSyms.enumerated() {
+            var a = Asset(id: s.name, kind: s.kind, vol: 0.02, price: c[k][idx])
+            a.hist = Array(c[k][(idx - 23)...idx])
+            list.append(a)
+        }
+        assets = list
+        trend = 0
+        log = "Реальный рынок. Период скрыт до конца забега."
+        nextInfo = moveText(idx + 1)
         actions = maxActions
         phase = .play
+    }
+
+    func moveText(_ day: Int) -> String {
+        var best = 0
+        var bestChg = 0.0
+        for k in realCols.indices {
+            let chg = realCols[k][day] / realCols[k][day - 1] - 1
+            if abs(chg) >= abs(bestChg) {
+                best = k
+                bestChg = chg
+            }
+        }
+        let arrow = bestChg >= 0 ? " ▲ " : " ▼ "
+        return Game.realSyms[best].name + arrow + String(format: "%.1f", abs(bestChg) * 100) + "%"
+    }
+
+    var period: String {
+        guard mode == .real, !realDates.isEmpty else { return "" }
+        return "Реальный период: \(realDates[startIdx]) — \(realDates[min(idx, realDates.count - 1)])"
     }
 
     func buy(_ i: Int, _ share: Double) {
@@ -129,15 +262,24 @@ final class Game: ObservableObject {
     func endDay() {
         guard phase == .play else { return }
         let e = next
+        if mode == .sim && Double.random(in: 0...1) < 0.25 {
+            trend = [-0.03, -0.01, 0, 0.01, 0.03].randomElement()!
+        }
         for i in assets.indices {
             let k: Double
             switch assets[i].kind {
             case .stock: k = e.s
+            case .fund: k = e.s * 0.6
             case .crypto: k = e.c
             case .realty: k = e.r
             }
             let v = assets[i].vol
-            assets[i].price = max(1, assets[i].price * (1 + k + Double.random(in: -v...v)))
+            if mode == .real {
+                assets[i].price = realCols[i][idx + 1]
+            } else {
+                let tr = assets[i].kind == .realty ? trend * 0.3 : trend
+                assets[i].price = max(1, assets[i].price * (1 + k + tr + Double.random(in: -v...v)))
+            }
             if assets[i].qty > 0 { assets[i].hold += 1 }
             assets[i].hist.append(assets[i].price)
             if assets[i].hist.count > 40 { assets[i].hist.removeFirst() }
@@ -146,10 +288,13 @@ final class Game: ObservableObject {
             }
         }
         worthHist.append(worth)
-        log = "День \(day): \(e.t)"
+        if mode == .real { idx += 1 }
+        let mood = trend > 0.005 ? " 🐂" : (trend < -0.005 ? " 🐻" : "")
+        log = mode == .real ? "День \(day): \(moveText(idx))" : "День \(day): \(e.t)\(mood)"
         day += 1
         actions = maxActions
         next = Game.events.randomElement()!
+        nextInfo = mode == .real ? moveText(idx + 1) : next.t
         if day > 30 {
             if has(.parachute) && !usedParachute {
                 usedParachute = true
@@ -225,6 +370,14 @@ struct Felt: View {
                     .blur(radius: 70)
                     .opacity(0.28)
             }
+            Canvas { ctx, size in
+                var y: CGFloat = 0
+                while y < size.height {
+                    ctx.fill(Path(CGRect(x: 0, y: y, width: size.width, height: 1)),
+                             with: .color(.black.opacity(0.14)))
+                    y += 4
+                }
+            }
         }
         .ignoresSafeArea()
     }
@@ -232,20 +385,10 @@ struct Felt: View {
 
 struct CRT: View {
     var body: some View {
-        ZStack {
-            Canvas { ctx, size in
-                var y: CGFloat = 0
-                while y < size.height {
-                    ctx.fill(Path(CGRect(x: 0, y: y, width: size.width, height: 1)),
-                             with: .color(.black.opacity(0.16)))
-                    y += 4
-                }
-            }
-            RadialGradient(colors: [.clear, .black.opacity(0.55)], center: .center,
-                           startRadius: 220, endRadius: 560)
-        }
-        .ignoresSafeArea()
-        .allowsHitTesting(false)
+        RadialGradient(colors: [.clear, .black.opacity(0.45)], center: .center,
+                       startRadius: 260, endRadius: 600)
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
     }
 }
 
@@ -256,7 +399,7 @@ struct Panel: ViewModifier {
             .padding(12)
             .background(RoundedRectangle(cornerRadius: 16).fill(T.panel))
             .overlay(RoundedRectangle(cornerRadius: 16).stroke(edge, lineWidth: 2.5))
-            .shadow(color: .black.opacity(0.75), radius: 0, x: 0, y: 5)
+            .background(RoundedRectangle(cornerRadius: 16).fill(Color.black.opacity(0.75)).offset(y: 5))
     }
 }
 
@@ -278,7 +421,7 @@ struct Chunky: ButtonStyle {
             .frame(maxWidth: .infinity)
             .background(RoundedRectangle(cornerRadius: 12).fill(color))
             .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.black.opacity(0.35), lineWidth: 2))
-            .shadow(color: .black.opacity(0.85), radius: 0, x: 0, y: configuration.isPressed ? 1 : 4)
+            .background(RoundedRectangle(cornerRadius: 12).fill(Color.black.opacity(0.85)).offset(y: configuration.isPressed ? 1 : 4))
             .offset(y: configuration.isPressed ? 3 : 0)
             .opacity(on ? 1 : 0.4)
     }
@@ -380,22 +523,39 @@ struct GameView: View {
         }
     }
 
+    func modeBtn(_ t: String, _ m: Mode) -> some View {
+        Button(t) { g.setMode(m) }
+            .buttonStyle(Chunky(color: g.mode == m ? T.gold : Color(red: 0.45, green: 0.45, blue: 0.6)))
+    }
+
     var pick: some View {
-        VStack(spacing: 18) {
+        VStack(spacing: 14) {
             Spacer()
-            Text("SOUL\nMARKET").font(T.f(48)).multilineTextAlignment(.center)
+            Text("SOUL\nMARKET").font(T.f(44)).multilineTextAlignment(.center)
                 .foregroundColor(T.gold).shadow(color: T.down, radius: 0, x: 3, y: 4)
-            Text("Твою душу выставили на рынок как актив. Выбери стиль и выкупи её.")
+            Text("Твою душу выставили на рынок как актив. Выбери режим и стиль.")
                 .font(T.f(14, .semibold)).foregroundColor(Color.white.opacity(0.7))
                 .multilineTextAlignment(.center)
+            HStack(spacing: 8) {
+                modeBtn("🎲 СИМУЛЯЦИЯ", .sim)
+                modeBtn("🌍 РЕАЛЬНЫЙ РЫНОК", .real)
+            }
+            Text(g.mode == .real
+                 ? "Реальные цены акций, ETF-фондов, крипты и REIT с бирж. Случайный период из последних 2 лет, даты скрыты до конца забега."
+                 : "Динамический рынок: события, бычьи 🐂 и медвежьи 🐻 полосы.")
+                .font(T.f(12, .semibold)).foregroundColor(Color.white.opacity(0.7))
+                .multilineTextAlignment(.center)
+            if g.loading { ProgressView("Загружаю котировки…").tint(T.gold) }
+            if !g.note.isEmpty { Text(g.note).font(T.f(12)).foregroundColor(T.down) }
             ForEach(Array(Build.allCases.enumerated()), id: \.offset) { i, b in
                 BigCard(icon: b.icon, title: b.rawValue, info: b.info, tilt: Double(i - 1) * 1.5) {
-                    g.start(b)
+                    g.startRun(b)
                 }
             }
             Spacer()
         }
         .padding(20)
+        .disabled(g.loading)
     }
 
     var relic: some View {
@@ -436,6 +596,7 @@ struct GameView: View {
                 Text(g.build.rawValue.uppercased()).font(T.f(11))
                     .padding(.horizontal, 8).padding(.vertical, 3)
                     .background(Capsule().fill(T.violet)).foregroundColor(.black)
+                Text(g.mode == .real ? "🌍" : "🎲").font(T.f(14))
                 Spacer()
                 Text("ДУША  \(money(g.soulPrice))").font(T.f(14)).foregroundColor(T.gold)
             }
@@ -468,7 +629,7 @@ struct GameView: View {
         VStack(alignment: .leading, spacing: 4) {
             Text("📰 \(g.log)").font(T.f(14))
             if g.has(.insider) {
-                Text("👁 Завтра: \(g.next.t)").font(T.f(13)).foregroundColor(T.gold)
+                Text("👁 Завтра: \(g.nextInfo)").font(T.f(13)).foregroundColor(T.gold)
             }
             if !g.relics.isEmpty {
                 Text(g.relics.map { $0.icon + " " + $0.rawValue }.joined(separator: "   "))
@@ -482,6 +643,7 @@ struct GameView: View {
     func kindName(_ k: Kind) -> String {
         switch k {
         case .stock: return "АКЦИИ"
+        case .fund: return "ФОНД (ETF)"
         case .crypto: return "КРИПТА"
         case .realty: return "НЕДВИЖИМОСТЬ"
         }
@@ -493,7 +655,7 @@ struct GameView: View {
         let chg = (a.price / prev - 1) * 100
         let col = chg >= 0 ? T.up : T.down
         let pct = (chg >= 0 ? "▲ " : "▼ ") + String(format: "%.1f", abs(chg)) + "%"
-        let q = String(format: "%.2f", a.qty)
+        let q = String(format: a.qty < 1 ? "%.4f" : "%.2f", a.qty)
         let pnl = (a.price - a.cost) * a.qty
         let pnlText = (pnl >= 0 ? "+" : "-") + money(abs(pnl))
         return VStack(spacing: 10) {
@@ -547,6 +709,10 @@ struct GameView: View {
                 .foregroundColor(c).shadow(color: .black, radius: 0, x: 3, y: 4)
             Text(s).font(T.f(15, .semibold)).foregroundColor(Color.white.opacity(0.7))
                 .multilineTextAlignment(.center)
+            if g.mode == .real {
+                Text(g.period).font(T.f(13, .semibold)).foregroundColor(T.gold)
+                    .multilineTextAlignment(.center)
+            }
             Text("День \(g.day) · капитал \(money(g.worth))").font(T.f(16)).panel(c.opacity(0.6))
             Button("НОВЫЙ ЗАБЕГ", action: restart)
                 .buttonStyle(Chunky(color: c))
