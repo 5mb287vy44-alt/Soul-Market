@@ -1,9 +1,5 @@
-name: Build IPA
-
-on:
-  push:
-    branches: [main]
-  workflow_dispatch:
+name: Build IPA & Release
+on: [push, workflow_dispatch]
 
 permissions:
   contents: write
@@ -12,36 +8,94 @@ jobs:
   build:
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Compile and pack ipa
+      - name: Select Xcode 16
         run: |
-          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          APP=build/Payload/SoulMarket.app
-          mkdir -p "$APP"
-          xcrun swiftc Sources/App.swift \
-            -sdk "$SDK" -target arm64-apple-ios16.0 \
-            -swift-version 5 -O -parse-as-library \
-            -o "$APP/SoulMarket"
-          cat > "$APP/Info.plist" <<'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-          <key>CFBundleExecutable</key><string>SoulMarket</string>
-          <key>CFBundleIdentifier</key><string>com.vibe.soulmarket</string>
-          <key>CFBundleName</key><string>Soul Market</string>
-          <key>CFBundleVersion</key><string>1</string>
-          <key>CFBundleShortVersionString</key><string>1.0</string>
-          <key>CFBundlePackageType</key><string>APPL</string>
-          <key>MinimumOSVersion</key><string>16.0</string>
-          <key>UILaunchScreen</key><dict/>
-          <key>UIDeviceFamily</key><array><integer>1</integer></array>
-          <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
-          </dict></plist>
-          EOF
-          cd build && zip -qr SoulMarket.ipa Payload
+          for v in 16.4 16.3 16.2 16.1; do
+            if [ -d "/Applications/Xcode_$v.app" ]; then
+              sudo xcode-select -s "/Applications/Xcode_$v.app"
+              break
+            fi
+          done
+          xcodebuild -version
 
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: build-${{ github.run_number }}
-          files: build/SoulMarket.ipa
+      - name: Generate App Icon
+        run: |
+          mkdir -p Sources/Assets.xcassets/AppIcon.appiconset
+          cat << 'EOF' > Sources/Assets.xcassets/Contents.json
+          { "info" : { "author" : "xcode", "version" : 1 } }
+          EOF
+          cat << 'EOF' > Sources/Assets.xcassets/AppIcon.appiconset/Contents.json
+          { "images" : [ { "idiom" : "universal", "platform" : "ios", "size" : "1024x1024", "filename" : "icon_1024.png" } ], "info" : { "author" : "xcode", "version" : 1 } }
+          EOF
+          python3 - << 'EOF'
+          import math
+          w = 1024
+          px = bytearray(w * w * 3)
+          for y in range(w):
+              for x in range(w):
+                  d = math.hypot(x - 512, y - 512)
+                  i = (y * w + x) * 3
+                  r, g, b = 6, 8 + int(30 * (1 - d / 724)), 30 + int(70 * (1 - d / 724))
+                  if d < 215:
+                      k = 1 - d / 215
+                      r, g, b = 0, int(150 + 80 * k), 255
+                  if 200 <= d < 232:
+                      r, g, b = 255, 255, 255
+                  if 360 <= d < 384:
+                      r, g, b = 255, 60, 160
+                  px[i] = r; px[i+1] = g; px[i+2] = b
+          open('icon.ppm', 'wb').write(f'P6\n{w} {w}\n255\n'.encode() + px)
+          EOF
+          sips -s format png icon.ppm --out Sources/Assets.xcassets/AppIcon.appiconset/icon_1024.png
+          rm icon.ppm
+
+      - name: Generate Xcode Project
+        run: |
+          brew install xcodegen
+          cat << 'EOF' > project.yml
+          name: NeonBeat
+          options:
+            bundleIdPrefix: com.vibe
+          targets:
+            NeonBeat:
+              type: application
+              platform: iOS
+              deploymentTarget: "16.0"
+              sources:
+                - Sources
+              settings:
+                base:
+                  SWIFT_VERSION: "5.0"
+                  SWIFT_OPTIMIZATION_LEVEL: "-O"
+                  ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+                  GENERATE_INFOPLIST_FILE: YES
+                  INFOPLIST_KEY_CFBundleDisplayName: "Neon Beat"
+                  INFOPLIST_KEY_UILaunchScreen_Generation: YES
+                  INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+                  CODE_SIGNING_REQUIRED: "NO"
+                  CODE_SIGNING_ALLOWED: "NO"
+          EOF
+          xcodegen generate
+          sed -i '' 's/objectVersion = 77;/objectVersion = 56;/g' NeonBeat.xcodeproj/project.pbxproj
+
+      - name: Build App (Release)
+        run: |
+          xcodebuild -project NeonBeat.xcodeproj -scheme NeonBeat -configuration Release -sdk iphoneos CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO clean build CONFIGURATION_BUILD_DIR=${{ github.workspace }}/build
+
+      - name: Create IPA
+        run: |
+          mkdir -p Payload
+          mv build/NeonBeat.app Payload/
+          zip -r NeonBeat.ipa Payload
+
+      - name: Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="v1.0.${{ github.run_number }}"
+          gh release create "$VERSION" .ipa \
+            --title "Neon Beat $VERSION" \
+          
