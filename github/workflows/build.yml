@@ -1,0 +1,47 @@
+name: Build IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile and pack ipa
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          APP=build/Payload/SoulMarket.app
+          mkdir -p "$APP"
+          xcrun swiftc Sources/App.swift \
+            -sdk "$SDK" -target arm64-apple-ios16.0 \
+            -swift-version 5 -O -parse-as-library \
+            -o "$APP/SoulMarket"
+          cat > "$APP/Info.plist" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>CFBundleExecutable</key><string>SoulMarket</string>
+          <key>CFBundleIdentifier</key><string>com.vibe.soulmarket</string>
+          <key>CFBundleName</key><string>Soul Market</string>
+          <key>CFBundleVersion</key><string>1</string>
+          <key>CFBundleShortVersionString</key><string>1.0</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>MinimumOSVersion</key><string>16.0</string>
+          <key>UILaunchScreen</key><dict/>
+          <key>UIDeviceFamily</key><array><integer>1</integer></array>
+          <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string></array>
+          </dict></plist>
+          EOF
+          cd build && zip -qr SoulMarket.ipa Payload
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          files: build/SoulMarket.ipa
