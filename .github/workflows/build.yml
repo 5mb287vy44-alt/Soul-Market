@@ -23,6 +23,79 @@ jobs:
             -sdk "$SDK" -target arm64-apple-ios16.0 \
             -swift-version 5 -O -parse-as-library \
             -o "$APP/SoulMarket"
+          cat > icon.b64 <<'B64'
+          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
+          B64
+          python3 -c "import base64;open('icon.png','wb').write(base64.b64decode(open('icon.b64').read()))"
           if [ -f icon.png ]; then
             sips -z 120 120 icon.png --out "$APP/AppIcon60x60@2x.png"
             sips -z 180 180 icon.png --out "$APP/AppIcon60x60@3x.png"
